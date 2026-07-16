@@ -32,3 +32,10 @@ controlled by splines that are evaluated at some other parameter values x.
 
 :class:`ConcatenatedDistributions`:
 Represents a multi-dimensional distribution that is the concatenation of multiple distributions.
+
+:class:`FlowDensity`:
+Wraps a (typically pretrained) ``flowjax`` normalizing flow as a numpyro distribution for one
+or more jointly-modeled coordinates (e.g. a color-magnitude density). Like
+:class:`NormalSpline`, this can optionally be conditioned on some other coordinate x (e.g.
+``phi1``). The flow's internal parameters are not exposed to numpyro and are not updated
+during inference -- it is meant to be trained separately and loaded in as a frozen density.

@@ -30,6 +30,7 @@ dependencies = [
     "numpyro",
     "numpyro_ext",
     "equinox",
+    "flowjax",
     "jax_ext @ git+https://github.com/adrn/jax-ext"
 ]
 

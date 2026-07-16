@@ -115,7 +115,7 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
 
     def component_sample(
         self,
-        key: jax._src.random.KeyArray,
+        key: jax.Array,
         sample_shape: tuple = (),
         x: ArrayLike | None = None,
     ) -> jax.Array:

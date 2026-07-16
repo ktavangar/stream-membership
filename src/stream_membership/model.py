@@ -330,7 +330,19 @@ class ModelComponent(eqx.Module, ModelMixin):
         self.coord_distributions = CoordinateMapping(coord_distributions)
         self.coord_parameters = CoordinateMapping(coord_parameters)
         self.default_x_coord = default_x_coord
-        self.conditional_data = conditional_data
+        # NOTE: conditional_data can also have coordinate names (str or tuple) as
+        # keys (e.g. a joint coordinate like ("bp_rp", "phot_g_mean_mag") may itself
+        # require conditional data). It must be wrapped in the same pytree-safe
+        # CoordinateMapping as coord_distributions/coord_parameters above --
+        # otherwise, as soon as any tuple keys are mixed in with string keys, JAX's
+        # default dict pytree flattening (which sorts keys with the builtin `<`)
+        # raises a TypeError when this Module is flattened (e.g. whenever a bound
+        # method of this instance, such as self._make_sample_order, is accessed,
+        # since equinox flattens `self` to construct the BoundMethod pytree). See
+        # CoordinateMapping's docstring / https://github.com/jax-ml/jax/issues/15358
+        self.conditional_data = CoordinateMapping(
+            conditional_data if conditional_data is not None else {}
+        )
 
         # def __post_init__(self):
         # Validate that the keys (i.e. coordinate names) in coord_distributions and
@@ -627,7 +639,7 @@ class ModelComponent(eqx.Module, ModelMixin):
 
     def sample(
         self,
-        key: jax._src.random.KeyArray,
+        key: jax.Array,
         sample_shape: Any = (),
         pars: dict[CoordinateName, Any] | None = None,
         dists: dict[CoordinateName, dist.Distribution] | None = None,

@@ -91,7 +91,7 @@ class NormalSpline(dist.Distribution):
 
     def sample(
         self,
-        key: jax._src.random.KeyArray,
+        key: jax.Array,
         sample_shape: Any = (),
         x: ArrayLike | None = None,
     ) -> jax.Array | Any:
