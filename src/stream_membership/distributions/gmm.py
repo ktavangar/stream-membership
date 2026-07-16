@@ -116,7 +116,7 @@ class IndependentGMM(dist.MixtureSameFamily):
         )
 
     def component_sample(
-        self, key: jax._src.random.KeyArray, sample_shape: tuple = ()
+        self, key: jax.Array, sample_shape: tuple = ()
     ) -> jax.Array:
         return self.component_distribution.sample(
             key,

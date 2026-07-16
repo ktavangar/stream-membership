@@ -64,4 +64,4 @@ pip-wheel-metadata/
 .DS_Store
 
 #Virtual Environment Folder
-stream-env
+stream-*env

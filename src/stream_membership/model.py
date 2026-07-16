@@ -627,7 +627,7 @@ class ModelComponent(eqx.Module, ModelMixin):
 
     def sample(
         self,
-        key: jax._src.random.KeyArray,
+        key: jax.Array,
         sample_shape: Any = (),
         pars: dict[CoordinateName, Any] | None = None,
         dists: dict[CoordinateName, dist.Distribution] | None = None,

@@ -62,7 +62,7 @@ class ConcatenatedDistributions(dist.Distribution):
 
     def sample(
         self,
-        key: jax._src.random.KeyArray,
+        key: jax.Array,
         sample_shape: tuple | None = None,
     ) -> jax.Array:
         """Sample from the concatenated distribution.
