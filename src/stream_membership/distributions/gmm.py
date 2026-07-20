@@ -63,15 +63,43 @@ class IndependentGMM(dist.MixtureSameFamily):
 
         component = dist.TruncatedNormal(**component_kwargs)
         component._batch_shape = (self._D, self._K)
-        super().__init__(
-            mixing_distribution=mixing_distribution,
-            component_distribution=component,
-            validate_args=validate_args,
-        )
-        self._dim_dim = -2
+        self._low = low
+        self._high = high
 
-        self._batch_shape = ()
-        self._event_shape = (self._D,)
+        # NOTE: we deliberately do *not* call `super().__init__()`
+        # (`MixtureSameFamily.__init__`) here. As of numpyro>=0.20,
+        # `MixtureSameFamily.__init__` asserts that `component_distribution.support`
+        # is a `ParameterFreeConstraint`, which a bounded `TruncatedNormal` never
+        # satisfies (its support is a parameterized `Interval(low, high)`). That
+        # check exists so the base class's generic `log_prob`/`cdf`/etc. can assume
+        # a fixed support across components, but `IndependentGMM` overrides all of
+        # those (see `log_prob`, `component_log_probs`, `support` below) and
+        # explicitly masks out-of-bounds values itself, so the restriction doesn't
+        # apply to us. Instead, we replicate the (small) subset of
+        # `MixtureSameFamily.__init__`'s bookkeeping that we actually rely on,
+        # skipping straight to `Distribution.__init__`. This mirrors the numpyro
+        # 0.19 and 0.20 implementations identically apart from the added assert.
+        n_components = getattr(mixing_distribution, "probs", None)
+        n_components = (
+            n_components.shape[-1]
+            if n_components is not None
+            else mixing_distribution.logits.shape[-1]
+        )
+        if component.batch_shape[-1] != n_components:
+            msg = (
+                "Component distribution batch shape last dimension "
+                f"(size={component.batch_shape[-1]}) needs to correspond to the "
+                f"mixture_size={n_components}!"
+            )
+            raise ValueError(msg)
+
+        dist.Distribution.__init__(
+            self, batch_shape=(), event_shape=(self._D,), validate_args=validate_args
+        )
+        self._mixing_distribution = mixing_distribution
+        self._component_distribution = component
+        self._mixture_size = n_components
+        self._dim_dim = -2
 
     @property
     def mixture_dim(self):
@@ -98,13 +126,60 @@ class IndependentGMM(dist.MixtureSameFamily):
             raise ValueError(msg)
 
         tmp = jnp.expand_dims(value, self.mixture_dim)
-        component_log_probs = self.component_distribution.log_prob(tmp)
+
+        # Two distinct NaN-gradient hazards are handled here, both stemming from
+        # the same root cause: real data can easily contain a point outside the
+        # (still-converging, during early SVI steps) truncation bounds, and
+        # naively computing log_prob there and masking the *output* with
+        # `jnp.where` is not gradient-safe.
+        #
+        # (1) Evaluating TruncatedNormal.log_prob() directly at an out-of-bounds
+        #     point gives the mathematically correct forward value (-inf), but
+        #     its *gradient* w.r.t. loc/scale is NaN, and `jnp.where` does not
+        #     protect against NaN gradients flowing through the branch it
+        #     doesn't select. Fix: clip the input into the valid support (a
+        #     "safe" placeholder that can never produce a NaN gradient) before
+        #     calling log_prob, so it's never evaluated at an invalid point.
+        # (2) `low`/`high` are shared across all K mixture components, so a
+        #     point outside bounds in even one dimension is out-of-support for
+        #     *every* component simultaneously. If we mask with a literal
+        #     `-jnp.inf`, `log_prob`'s `logsumexp` below is then taken over a
+        #     vector that is entirely -inf, which is a genuine 0/0 in
+        #     logsumexp's softmax-gradient formula (NaN), independent of fix
+        #     (1) above. Fix: mask with a large-but-finite sentinel instead of
+        #     literal -inf, so it's numerically indistinguishable from zero
+        #     probability but keeps logsumexp's gradient well-defined.
+        # See: https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where
+        low = jnp.asarray(-jnp.inf) if self._low is None else jnp.asarray(self._low)
+        high = jnp.asarray(jnp.inf) if self._high is None else jnp.asarray(self._high)
+        # `tmp` has shape (..., D, K) (K = number of mixture components,
+        # broadcast via `mixture_dim=-1`). `low`/`high` describe a per-
+        # dimension (D) bound that doesn't depend on K, so they need a
+        # trailing size-1 axis to broadcast against `tmp`'s last axis. But
+        # `self._low`/`self._high` may *already* carry that trailing axis:
+        # `__init__` requires shape (D, 1) (not bare (D,)) for `low`/`high`
+        # to broadcast correctly against `loc`/`scale`'s (D, K) shape when
+        # constructing the underlying `TruncatedNormal` (a raw (D,) array
+        # would wrongly align against the *K* axis there instead of *D*, and
+        # fail unless D happened to equal K). So only append a new axis here
+        # if `low`/`high` are still in bare 1-D (D,) form (e.g. if a caller
+        # passes a plain list per the docstring) -- appending one
+        # unconditionally double-adds an axis for the (D, 1) case already
+        # required by construction, producing an unbroadcastable (D, 1, 1)
+        # array (only surfaces once this GMM is evaluated with D > 1, e.g.
+        # inside a `ComponentMixtureModel`, since a D=1 mismatch is masked by
+        # broadcasting's leading-1 rule).
+        low = low.reshape(low.shape + (1,)) if low.ndim == 1 else low
+        high = high.reshape(high.shape + (1,)) if high.ndim == 1 else high
+        safe_tmp = jnp.clip(tmp, low, high)
+        component_log_probs = self.component_distribution.log_prob(safe_tmp)
 
         value = jnp.expand_dims(value, axis=-1)
+        neg_inf_sentinel = jnp.asarray(-1e10, dtype=component_log_probs.dtype)
         return jnp.where(
             self.component_distribution.support.check(value),
             component_log_probs,
-            -jnp.inf,
+            neg_inf_sentinel,
         )
 
     def log_prob(self, value: ArrayLike) -> jax.Array:

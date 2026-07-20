@@ -180,8 +180,53 @@ class TruncatedNormalSpline(NormalSpline):
 
     def _make_helper_dist(self, x: ArrayLike | None = None) -> dist.Normal:
         x = self.x if x is None else x
+        loc = _clip_preserve_gradients(self._loc_spl(x), *self.clip_locs)
+
+        # --- fix for "FloatingPointError: invalid value (nan) encountered
+        # in mul" during SVI, verified against real production data ---
+        # `clip_locs` (set by the caller, e.g. (-10, 10) for a Uniform(-10,
+        # 10) prior on loc_vals) and `low`/`high` (the truncation window,
+        # e.g. a narrow data/polygon-derived pm range) are independent and
+        # can be very different sizes. During SVI, `loc` (this spline's
+        # interpolated mean) is only constrained by `clip_locs`, so nothing
+        # stops it from being pushed -- via an Adam step, especially after a
+        # huge early loss -- to a value many `scale`s outside [low, high]
+        # even though `clip_locs` itself was respected.
+        #
+        # When that happens, `dist.TruncatedNormal(loc, scale, low, high)`'s
+        # normalizing constant Z = CDF(high) - CDF(low) (evaluated in the
+        # *standardized*, i.e. (x - loc) / scale, frame) underflows to
+        # exactly 0.0 in float arithmetic once loc is far enough outside
+        # [low, high] relative to scale. That makes log_prob evaluate to
+        # +inf (not -inf!) instead of a large-but-finite negative number,
+        # and autodiff resolves the resulting 0/0 in d(log Z)/d(loc) as NaN.
+        # That NaN then poisons every parameter sharing this mixture
+        # component on the very next Adam step -- this is exactly the
+        # observed bug: step 1 loss=-inf (since Trace_ELBO's loss = -ELBO,
+        # and ELBO -> +inf when log_prob -> +inf), then step 2 loss=nan,
+        # with every `pm2` guide parameter (loc_vals, scale_vals,
+        # mixing_distribution, and even the unrelated per-datapoint
+        # `:modeldata` sites, since they share the same guide param
+        # gradient step) going NaN simultaneously.
+        #
+        # Reproduced directly: `TruncatedNormal(loc=-10, scale=0.1, low=-5,
+        # high=5).log_prob(0.0)` gives `log_prob=inf`, `grad_loc=nan`,
+        # `grad_scale=nan`; the same call with `loc` clipped into [-5, 5]
+        # first gives a finite (if large, since it's a genuinely unlikely
+        # configuration) loss and finite gradients.
+        #
+        # Fix: additionally clip `loc` into [low, high] (only when both are
+        # set), using the same straight-through-gradient trick already used
+        # for `clip_locs`/`clip_scales` above, so `loc` can never be pushed
+        # far enough outside the truncation window to underflow Z, no
+        # matter how wide the caller's `clip_locs` is. The forward value is
+        # clipped (fixing the numerics); the gradient still flows as if
+        # unclipped (so optimization isn't blocked at the boundary).
+        if self.low is not None and self.high is not None:
+            loc = _clip_preserve_gradients(loc, self.low, self.high)
+
         return dist.TruncatedNormal(
-            loc=_clip_preserve_gradients(self._loc_spl(x), *self.clip_locs),
+            loc=loc,
             scale=_clip_preserve_gradients(self._scale_spl(x), *self.clip_scales),
             low=self.low,
             high=self.high,

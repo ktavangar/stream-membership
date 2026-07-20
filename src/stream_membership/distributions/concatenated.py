@@ -119,14 +119,28 @@ class ConcatenatedConstraints(Constraint):
     def __call__(self, value):
         assert value.shape[self.event_dim] == sum(self.sizes)
 
+        # Same shape-normalization issue as `ConcatenatedTransforms.
+        # log_abs_det_jacobian` (see the comment there): a scalar
+        # (event_dim=0) constraint's boolean result retains the sliced
+        # trailing "size" axis (e.g. shape (..., 1) for a size-1
+        # coordinate), but a vector-valued (event_dim>=1) constraint (e.g. a
+        # `real_vector`-support coordinate like a 2D CMD term) already
+        # reduces over that axis, returning shape (...,) with no trailing
+        # axis at all. Concatenating these directly raises a shape error, so
+        # normalize every per-coordinate result down to a single boolean
+        # per coordinate (shape `(*pre_shape, 1)`) before concatenating.
+        pre_shape = value.shape[:-1]
+
         i = 0
         results = []
         for constraint, size in zip(self.constraints, self.sizes, strict=True):
-            results.append(
-                constraint(
-                    slice_along_axis(value, slc=(i, i + size), axis=self.event_dim)
-                )
-            )
+            this_value = slice_along_axis(value, slc=(i, i + size), axis=self.event_dim)
+            result = constraint(this_value)
+
+            extra_dims = jnp.ndim(result) - len(pre_shape)
+            if extra_dims > 0:
+                result = jnp.all(result, axis=tuple(range(-extra_dims, 0)))
+            results.append(jnp.reshape(result, (*pre_shape, 1)))
             i += size
         results = jnp.concatenate(results, axis=self.event_dim)
         return results.all(axis=self.event_dim)
@@ -210,11 +224,33 @@ class ConcatenatedTransforms(Transform):
         )
 
     def log_abs_det_jacobian(self, x, y, intermediates=None):
+        # As in `ConcatenatedDistributions.component_log_probs`, we want
+        # exactly one scalar jacobian contribution per *coordinate* (not per
+        # underlying array element), regardless of that coordinate's own
+        # `size`. For an ordinary scalar (event_dim=0) sub-transform, `trans`
+        # returns a jacobian with the same trailing "size" axis as `xx`/`yy`
+        # (e.g. shape (..., 1) for a size-1 coordinate) -- but for a
+        # vector-valued coordinate whose bijector has event_dim >= 1 (e.g. a
+        # `real_vector`-support coordinate like a 2D CMD term), numpyro's
+        # transform machinery already reduces/sums over that consumed event
+        # axis, so `trans.log_abs_det_jacobian` returns a jacobian *without*
+        # a trailing "size" axis at all. Naively concatenating these
+        # differently-ranked outputs raises a shape error, so we normalize
+        # each contribution to shape `(*pre_shape, 1)` first: sum away any
+        # leftover trailing axes beyond `pre_shape`, then add back a unit
+        # axis for concatenation.
+        pre_shape = x.shape[:-1]
+
         jacs = []
         for i, trans, size in self._iter_transforms():
             xx = slice_along_axis(x, (i, i + size))
             yy = slice_along_axis(y, (i, i + size))
-            jacs.append(trans.log_abs_det_jacobian(xx, yy, intermediates=intermediates))
+            jac = trans.log_abs_det_jacobian(xx, yy, intermediates=intermediates)
+
+            extra_dims = jnp.ndim(jac) - len(pre_shape)
+            if extra_dims > 0:
+                jac = jnp.sum(jac, axis=tuple(range(-extra_dims, 0)))
+            jacs.append(jnp.reshape(jac, (*pre_shape, 1)))
 
         return jnp.concatenate(jacs, axis=self.axis)
 

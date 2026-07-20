@@ -227,7 +227,22 @@ class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
         self, value: ArrayLike, x: ArrayLike | None = None
     ) -> jax.Array:
         x = x if x is not None else self.x
+        value = jnp.asarray(value)
+
+        # NOTE: we tried a "clip value into [low, high] before computing
+        # component_log_probs" fix here, on the theory that a `value` far
+        # outside [low, high] could produce a NaN gradient that then leaks
+        # through the `jnp.where` mask below. Direct testing (both of
+        # numpyro's raw `TruncatedNormal.log_prob` and of this class) showed
+        # that an out-of-bounds `value` alone -- with `loc` inside
+        # [low, high] -- never actually produces a NaN gradient; numpyro
+        # already handles that case safely. So that fix was reverted as
+        # unnecessary/not the real root cause. The actual bug (loc drifting
+        # outside [low, high]) is fixed at its source in
+        # `normal_spline.py`'s `TruncatedNormalSpline._make_helper_dist`,
+        # see the comment there for the verified mechanism.
         component_log_probs = super().component_log_probs(value, x)
+
         value = jnp.expand_dims(value, axis=-1)
         return jnp.where(
             self.support.check(value),
