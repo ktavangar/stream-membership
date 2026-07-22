@@ -28,8 +28,8 @@ def _eval_poly(coeffs: ArrayLike, x: ArrayLike) -> jax.Array:
 
 class IsochroneCMD(dist.Distribution):
     """
-    Joint (color, magnitude) density for a single-stellar-population (SSP)
-    isochrone track, evaluated at a phi1-dependent apparent distance
+    Joint (magnitude1, magnitude2) density for a single-stellar-population
+    (SSP) isochrone track, evaluated at a phi1-dependent apparent distance
     modulus -- following the stream CMD modeling approach of Starkman et al.
     2025 ("Stream Members Only"). Rather than a flexible density estimator
     (as used for the more data-rich background CMD; see ``FlowDensity`` /
@@ -39,6 +39,19 @@ class IsochroneCMD(dist.Distribution):
     shifted along phi1 by a distance-modulus track, with intrinsic Gaussian
     scatter in color around the ridge line and a uniform marginal density in
     absolute magnitude over the isochrone's valid range.
+
+    Observed data is passed as two raw apparent magnitudes,
+    ``(magnitude1, magnitude2)`` -- e.g. ``(PS_g, PS_r)`` -- matching the
+    same two-raw-band convention used elsewhere in this codebase (e.g. the
+    background's ``CalibratedFlowDensity`` term), rather than a precomputed
+    ``(color, magnitude)`` pair. Internally, ``color = magnitude1 -
+    magnitude2`` and ``magnitude1`` is treated as the apparent magnitude,
+    consistent with ``track_abs_mag``/``track_color`` below (see
+    ``generate_stream_isochrone.py``, which builds ``track_abs_mag =
+    abs_mag1`` and an implicit ``track_color = abs_mag1 - abs_mag2``). Both
+    components must therefore share the same shared coordinate ordering as
+    the isochrone track was generated with (``mag_param_name1``,
+    ``mag_param_name2``).
 
     Follows the same conditioning convention as the rest of this codebase's
     distributions (``NormalSpline``, ``FlowDensity``, ...): ``x`` (here,
@@ -143,13 +156,17 @@ class IsochroneCMD(dist.Distribution):
 
     def log_prob(self, value: ArrayLike, x: ArrayLike | None = None) -> jax.Array | Any:
         """
-        Evaluates the log probability density for a batch of (color,
-        magnitude) samples, e.g. ``(bp_rp, phot_g_mean_mag)``.
+        Evaluates the log probability density for a batch of (magnitude1,
+        magnitude2) samples, e.g. ``(PS_g, PS_r)``.
 
         Parameters
         ----------
         value
-            Array of shape ``(..., 2)`` with columns ``(color, magnitude)``.
+            Array of shape ``(..., 2)`` with columns ``(magnitude1,
+            magnitude2)`` -- two raw apparent magnitudes, NOT a precomputed
+            ``(color, magnitude)`` pair. The color is computed internally
+            as ``magnitude1 - magnitude2``, and ``magnitude1`` is used as
+            the apparent magnitude.
         x
             Array of phi1 values at which to evaluate the distance modulus.
             If not provided, the ``x`` values provided at initialization
@@ -157,7 +174,9 @@ class IsochroneCMD(dist.Distribution):
         """
         x = self.x if x is None else jnp.asarray(x)
         value = jnp.asarray(value)
-        color_obs, mag_obs = value[..., 0], value[..., 1]
+        mag1_obs, mag2_obs = value[..., 0], value[..., 1]
+        color_obs = mag1_obs - mag2_obs
+        mag_obs = mag1_obs
 
         dm = self._distmod(x)
         abs_mag = mag_obs - dm
@@ -185,11 +204,13 @@ class IsochroneCMD(dist.Distribution):
         x: ArrayLike | None = None,
     ) -> jax.Array | Any:
         """
-        Draws (color, magnitude) samples: absolute magnitude uniform over
-        the track's valid range, color drawn from a Gaussian around the
-        (offset) isochrone ridge line at that absolute magnitude, then both
-        shifted to apparent magnitude via the phi1-dependent distance
-        modulus.
+        Draws (magnitude1, magnitude2) samples: absolute magnitude uniform
+        over the track's valid range, color drawn from a Gaussian around
+        the (offset) isochrone ridge line at that absolute magnitude, then
+        both shifted to apparent magnitude via the phi1-dependent distance
+        modulus and converted back to the raw (magnitude1, magnitude2)
+        pair (``magnitude1`` = apparent magnitude, ``magnitude2`` =
+        ``magnitude1 - color``).
         """
         # NOTE: a per-call `x` must *fully* override the batch shape (matching
         # `log_prob`'s convention, and the sibling `NormalSpline.sample`),
@@ -213,6 +234,7 @@ class IsochroneCMD(dist.Distribution):
         color = pred_color + self.color_scale * jax.random.normal(key_color, shape)
 
         dm = self._distmod(jnp.broadcast_to(x, shape))
-        mag = abs_mag + dm
+        mag1 = abs_mag + dm
+        mag2 = mag1 - color
 
-        return jnp.stack([color, mag], axis=-1)
+        return jnp.stack([mag1, mag2], axis=-1)
