@@ -6,7 +6,7 @@
 __pycache__
 .github
 paper/jats
-
+claude*
 
 *.png
 *.pdf
