@@ -181,6 +181,29 @@ class IsochroneCMD(dist.Distribution):
         dm = self._distmod(x)
         abs_mag = mag_obs - dm
 
+        # --- fix for SVI diverging to +inf loss ---
+        # This used to be `jnp.where(in_range, color_lp + mag_lp, -jnp.inf)`,
+        # i.e. an exact zero density (`-inf` log_prob) for any star whose
+        # implied abs_mag falls outside the fixed isochrone track's
+        # [abs_mag_min, abs_mag_max] range. Verified directly on real GD-1
+        # data that during SVI (free `dm_offset` + fitted phi1-dependent
+        # splines), at least one star's implied abs_mag routinely gets
+        # pushed just past this boundary -- one star already sits at the
+        # track's bright-end edge even at dm_offset=0. The instant that
+        # happens, that single star's `-inf` makes the whole particle's
+        # log-joint `-inf`, so the SVI loss jumps to `+inf`; and because a
+        # hard cutoff contributes exactly zero gradient, the optimizer gets
+        # no signal to correct course and the fit never recovers.
+        #
+        # Fix: evaluate the predicted color using abs_mag *clipped* into the
+        # track's valid range via the same straight-through-gradient trick
+        # used elsewhere in this codebase (`_clip_preserve_gradients`) --
+        # the forward value is clamped to the boundary (so `_color_spl` is
+        # never evaluated out of its domain and `mag_lp` is always the same
+        # finite constant), while the gradient still flows as if unclipped.
+        # A star sitting off the track now pulls the fit back via the
+        # (smooth, always-finite) color-mismatch term instead of a hard
+        # -inf cliff.
         clipped_abs_mag = _clip_preserve_gradients(
             abs_mag, self._abs_mag_min, self._abs_mag_max
         )
@@ -194,8 +217,7 @@ class IsochroneCMD(dist.Distribution):
         # population luminosity function isn't modeled here.
         mag_lp = -jnp.log(self._abs_mag_max - self._abs_mag_min)
 
-        in_range = (abs_mag >= self._abs_mag_min) & (abs_mag <= self._abs_mag_max)
-        return jnp.where(in_range, color_lp + mag_lp, -jnp.inf)
+        return color_lp + mag_lp
 
     def sample(
         self,
