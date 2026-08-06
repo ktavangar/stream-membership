@@ -1,4 +1,4 @@
-__all__ = ["LinearGradient1D", "LinearGradientSpline"]
+__all__ = ["LinearGradient1D", "LinearGradientSpline", "LinearGradientSplineWithGap"]
 
 from typing import Any
 
@@ -12,6 +12,21 @@ from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
 
 def _clip_preserve_gradients(x, min_, max_):
     return x + lax.stop_gradient(jnp.clip(x, min_, max_) - x)
+
+
+def _eval_poly(coeffs: ArrayLike, x: ArrayLike) -> jax.Array:
+    """Horner evaluation of polynomial coefficients (highest power first,
+    matching ``numpy.poly1d``'s convention). Duplicated from
+    ``isochrone_cmd.py`` (small enough that it's kept file-local, matching
+    this module's existing convention of not cross-importing private
+    helpers -- see ``_clip_preserve_gradients`` above)."""
+    coeffs = jnp.asarray(coeffs)
+
+    def body(acc, c):
+        return acc * x + c, None
+
+    result, _ = lax.scan(body, jnp.zeros_like(x, dtype=coeffs.dtype), coeffs)
+    return result
 
 
 class LinearGradient1D(dist.Distribution):
@@ -205,6 +220,207 @@ class LinearGradientSpline(dist.Distribution):
         """
         helper = self._make_helper_dist(x)
         return helper.log_prob(value)
+
+    @property
+    def support(self):
+        return dist.constraints.interval(self.low, self.high)
+
+
+class LinearGradientSplineWithGap(dist.Distribution):
+    """
+    A `LinearGradientSpline` variant for a coordinate (e.g. phi2) whose
+    training data has an interior band censored out ("gap") -- e.g. the
+    background's phi2 density, fit on data with the on-stream footprint
+    masked out. The gap's edges can themselves vary with the conditioning
+    variable ``x`` (e.g. following a phi1-dependent stream track/pawprint
+    footprint).
+
+    This explicitly renormalizes the likelihood by the model's own predicted
+    probability mass inside the excised gap, ``P_gap(a)``, i.e. use
+    ``log p(x) - log(1 - P_gap(a))`` instead of the naive ``log p(x)``.
+    This is exact for *any* gap position or degree of asymmetry -- no
+    symmetry assumption required -- and, because `LinearGradient1D`'s CDF
+    is already closed-form (the same quadratic used by its ``icdf``),
+    ``P_gap(a)`` is cheap, closed-form, and fully differentiable: no
+    numerical integration needed.
+
+    Parameters
+    ----------
+    a_vals
+        Array of tilt parameter (`a`) values at the knot locations (same as
+        `LinearGradientSpline`).
+    knots
+        Array of spline knot locations for the `a` spline (same as
+        `LinearGradientSpline`).
+    x
+        Array of x values at which to evaluate the `a` spline and the
+        (possibly x-dependent) gap edges.
+    low
+        Lower bound of the (fixed, not x-dependent) distribution domain.
+    high
+        Upper bound of the (fixed, not x-dependent) distribution domain.
+    gap_center_spl
+        Spline for the gap's center as a function of ``x``. This must be
+        precomputed and passed in, e.g. by fitting a spline to the on-sky 
+        footprint's centerline.
+    gap_half_width
+        Half-width of the gap which can be fixed or an x-dependent spline.
+        If x-dependent, this must be precomputed and passed in.
+    spline_k (optional)
+        Degree of the `a` spline. Default 3.
+    clip_a (optional)
+        Same as `LinearGradientSpline`: if specified, clips the
+        spline-interpolated tilt parameter `a` into this range (using a
+        straight-through-gradient trick). Recommended, e.g. ``(-0.999,
+        0.999)``, since nothing else stops an optimizer from pushing `a`
+        outside the valid ``(-1, 1)`` range during SVI.
+    """
+
+    def __init__(
+        self,
+        a_vals: ArrayLike,
+        knots: ArrayLike,
+        x: ArrayLike,
+        low: ArrayLike,
+        high: ArrayLike,
+        gap_center_spl: InterpolatedUnivariateSpline,
+        gap_half_width: ArrayLike,
+        spline_k: int = 3,
+        clip_a: tuple[float | None, float | None] = (None, None),
+    ) -> None:
+        x = jnp.asarray(x)
+        super().__init__(batch_shape=x.shape, event_shape=())
+
+        self.knots = jnp.array(knots)
+        self.low = low
+        self.high = high
+        self.gap_center_spl = gap_center_spl
+        if isinstance(gap_half_width, InterpolatedUnivariateSpline):
+            self.gap_half_width_spl = gap_half_width
+        else:
+            self.gap_half_width = jnp.asarray(gap_half_width)
+        self.clip_a = tuple(clip_a)
+
+        self.spline_k = int(spline_k)
+        self.x = x
+        self.a_vals = jnp.array(a_vals)
+
+        if self.a_vals.ndim == 0:
+            self._a_spl = lambda _: self.a_vals
+        else:
+            self._a_spl = InterpolatedUnivariateSpline(
+                self.knots,
+                self.a_vals,
+                k=self.spline_k,
+                endpoints="not-a-knot",
+            )
+
+    def _gap_bounds(self, x: ArrayLike) -> tuple[jax.Array, jax.Array]:
+        """Evaluate the fixed (not-fit) gap edges at `x`."""
+        if hasattr(self, "gap_half_width_spl"):
+            g1 = self.gap_center_spl(x) - self.gap_half_width_spl(x)
+            g2 = self.gap_center_spl(x) + self.gap_half_width_spl(x)
+        else:
+            g1 = self.gap_center_spl(x) - self.gap_half_width
+            g2 = self.gap_center_spl(x) + self.gap_half_width
+        return g1, g2
+
+    @staticmethod
+    def _cdf_s(a: ArrayLike, s: ArrayLike) -> jax.Array:
+        """CDF of `LinearGradient1D` in the rescaled coordinate ``s = (x -
+        low) / (high - low) in [0, 1]`` -- the same ``F(s) = a*s**2 +
+        (1-a)*s`` used by `LinearGradient1D.icdf`."""
+        return a * s**2 + (1 - a) * s
+
+    def _gap_log_mass(self, a: ArrayLike, x: ArrayLike) -> jax.Array:
+        """``log(1 - P_gap(a))``, the log-normalization correction for the
+        probability mass the (uncensored) model would assign to the gap at
+        this `x`."""
+        g1, g2 = self._gap_bounds(x)
+        s1 = (g1 - self.low) / (self.high - self.low)
+        s2 = (g2 - self.low) / (self.high - self.low)
+        p_gap = self._cdf_s(a, s2) - self._cdf_s(a, s1)
+        # Guard against p_gap creeping to/past 1 during early SVI steps
+        # (e.g. if a is transiently extreme), which would send log(1-p_gap)
+        # to -inf/NaN. Straight-through-gradient clip, as used elsewhere in
+        # this codebase (see IsochroneCMD, IndependentGMM).
+        p_gap = _clip_preserve_gradients(p_gap, 0.0, 1 - 1e-6)
+        return jnp.log1p(-p_gap)
+
+    def _tilt(self, x: ArrayLike) -> jax.Array:
+        return _clip_preserve_gradients(self._a_spl(x), *self.clip_a)
+
+    def _make_helper_dist(self, x: ArrayLike | None = None) -> LinearGradient1D:
+        x = self.x if x is None else jnp.asarray(x)
+        a = self._tilt(x)
+        return LinearGradient1D(a=a, low=self.low, high=self.high)
+
+    def sample(
+        self,
+        key: jax.Array,
+        sample_shape: Any = (),
+        x: ArrayLike | None = None,
+    ) -> jax.Array | Any:
+        """
+        Draws samples from the (gap-excised, renormalized) distribution, by
+        inverse-CDF sampling with the gap's CDF interval collapsed out.
+
+        Parameters
+        ----------
+        key
+            JAX random number generator key.
+        sample_shape
+            Shape of the sample.
+        x
+            Array of x values at which to evaluate the spline and the gap
+            edges. If not provided, the x values provided at initialization
+            will be used.
+        """
+        x = self.x if x is None else jnp.asarray(x)
+        a = self._tilt(x)
+        g1, g2 = self._gap_bounds(x)
+        s1 = (g1 - self.low) / (self.high - self.low)
+        s2 = (g2 - self.low) / (self.high - self.low)
+        p_gap = _clip_preserve_gradients(
+            self._cdf_s(a, s2) - self._cdf_s(a, s1), 0.0, 1 - 1e-6
+        )
+        f_g1 = self._cdf_s(a, s1)
+
+        shape = tuple(sample_shape) + x.shape
+        v = jax.random.uniform(key, shape=shape)
+        # Map v in [0, 1] (the *observed*, gap-excised CDF) to p in [0, 1]
+        # (the base, un-excised CDF), by inserting the gap's CDF interval
+        # [f_g1, f_g1 + p_gap] wherever v crosses f_g1 / (1 - p_gap).
+        below_gap = v <= (f_g1 / (1 - p_gap))
+        p = jnp.where(below_gap, v * (1 - p_gap), v * (1 - p_gap) + p_gap)
+
+        helper = LinearGradient1D(a=a, low=self.low, high=self.high)
+        return helper.icdf(p)
+
+    def log_prob(self, value: ArrayLike, x: ArrayLike | None = None) -> jax.Array | Any:
+        """
+        Evaluates the log probability density (renormalized for the excised
+        gap) for a batch of samples given by value.
+
+        Parameters
+        ----------
+        value
+            Array of samples to evaluate the log probability for. Assumed
+            to already exclude the gap (e.g. real background data, which by
+            construction has nothing in the on-sky-masked corridor) --
+            evaluating this at a value that falls inside the gap will
+            silently return the (renormalized) density there rather than
+            flagging an error, since nothing here checks `value` against
+            `_gap_bounds`.
+        x
+            Array of x values at which to evaluate the spline and the gap
+            edges. If not provided, the x values provided at initialization
+            will be used.
+        """
+        x = self.x if x is None else jnp.asarray(x)
+        a = self._tilt(x)
+        helper = LinearGradient1D(a=a, low=self.low, high=self.high)
+        return helper.log_prob(value) - self._gap_log_mass(a, x)
 
     @property
     def support(self):
