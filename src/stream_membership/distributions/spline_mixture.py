@@ -6,22 +6,27 @@ import jax
 import jax.numpy as jnp
 import numpyro.distributions as dist
 from jax.typing import ArrayLike
+from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
 
 from stream_membership.distributions import NormalSpline, TruncatedNormalSpline
+from stream_membership.distributions.normal_spline import _clip_preserve_gradients
 
 
 
 class Normal1DSplineMixture(dist.MixtureGeneral):
     def __init__(
         self,
-        mixing_distribution: dist.CategoricalProbs | dist.CategoricalLogits,
-        loc_vals: ArrayLike,
-        scale_vals: ArrayLike,
-        knots: ArrayLike,
-        x: ArrayLike,
+        mixing_distribution: dist.CategoricalProbs | dist.CategoricalLogits | None = None,
+        loc_vals: ArrayLike = None,
+        scale_vals: ArrayLike = None,
+        knots: ArrayLike = None,
+        x: ArrayLike = None,
+        mixing_vals: ArrayLike | None = None,
+        mixing_knots: ArrayLike | None = None,
         spline_k: int | dict[str, int] = 3,
         clip_locs: tuple[float | None, float | None] = (None, None),
         clip_scales: tuple[float | None, float | None] = (None, None),
+        clip_mixing_logits: tuple[float | None, float | None] = (None, None),
         ordered_scales: bool = True,
         validate_args=None,
     ) -> None:
@@ -34,21 +39,43 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
 
         x
             Array of x values at which to evaluate the splines.
+        mixing_distribution (optional)
+            A fixed (not x-dependent) mixing distribution over components, e.g.
+            ``dist.Categorical(probs=...)``. Exactly one of ``mixing_distribution`` or
+            ``mixing_vals`` must be provided.
+        mixing_vals (optional)
+            Array of shape ``(n_components, n_mixing_knots)`` giving per-knot mixing
+            logits for each component. If provided, the mixing weights are
+            deterministically spline-interpolated (and softmaxed) at ``x``, exactly the
+            way ``loc_vals``/``scale_vals`` are turned into per-x ``loc``/``scale``
+            values -- i.e. this makes the mixing weights vary smoothly with ``x`` (e.g.
+            phi1) instead of being fixed for the whole dataset. Exactly one of
+            ``mixing_distribution`` or ``mixing_vals`` must be provided.
+        mixing_knots (optional)
+            Array of spline knot locations for the mixing-weight spline. Defaults to
+            ``knots`` (the same knots used for loc/scale) if not given.
         spline_k
-            Degree of the spline.
+            Degree of the spline. Can be a single integer, applied to loc, scale, and
+            mixing splines, or a dict with keys "loc", "scale", "mixing".
+        clip_mixing_logits (optional)
+            Bounds to clip the interpolated mixing logits into, using the same
+            straight-through-gradient trick as ``clip_locs``/``clip_scales``. Only used
+            when ``mixing_vals`` is provided.
         """
         # Should have shape (n_knots, )
         self.knots = jnp.array(knots)
         self._n_knots = len(self.knots)
         self.clip_locs = tuple(clip_locs)
         self.clip_scales = tuple(clip_scales)
+        self.clip_mixing_logits = tuple(clip_mixing_logits)
 
         # The pre-specified grid to evaluate on
         self.x = jnp.array(x)
 
         # Spline order:
         if not isinstance(spline_k, dict):
-            spline_k = {"loc": spline_k, "scale": spline_k}
+            spline_k = {"loc": spline_k, "scale": spline_k, "mixing": spline_k}
+        spline_k.setdefault("mixing", spline_k.get("loc", 3))
         self.spline_k = spline_k
 
         # Should have shape (n_components, n_knots)
@@ -91,19 +118,77 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
                 axis=0,
             )
 
+        # If mixing_vals is provided, the mixing weights are a deterministic
+        # spline function of x (per-component logits interpolated from
+        # mixing_vals at the knots, then softmaxed) instead of a single fixed
+        # mixing_distribution shared across all x. Exactly one of
+        # mixing_distribution / mixing_vals must be provided.
+        if (mixing_distribution is None) == (mixing_vals is None):
+            msg = (
+                "Exactly one of `mixing_distribution` or `mixing_vals` must be "
+                "provided to Normal1DSplineMixture/TruncatedNormal1DSplineMixture."
+            )
+            raise ValueError(msg)
+
+        self.mixing_vals = None
+        self.mixing_knots = None
+        self._mixing_spls = None
+        if mixing_vals is not None:
+            self.mixing_vals = jnp.array(mixing_vals)
+            self.mixing_knots = (
+                jnp.array(mixing_knots) if mixing_knots is not None else self.knots
+            )
+            if validate_args and self.mixing_vals.shape[0] != self._n_components:
+                msg = (
+                    "mixing_vals must have shape (n_components, n_mixing_knots), "
+                    f"but got shape {self.mixing_vals.shape} for "
+                    f"{self._n_components} components."
+                )
+                raise ValueError(msg)
+            self._mixing_spls = [
+                InterpolatedUnivariateSpline(
+                    self.mixing_knots,
+                    self.mixing_vals[i],
+                    k=self.spline_k["mixing"],
+                )
+                for i in range(self._n_components)
+            ]
+            init_mixing_distribution = self._make_mixing_distribution(self.x)
+        else:
+            init_mixing_distribution = mixing_distribution
+
         super().__init__(
-            mixing_distribution,
+            init_mixing_distribution,
             self._make_components(),
             validate_args=validate_args,
         )
 
-        expected = (self.x.size, self._n_components)
-        if validate_args and self.mixing_distribution.probs.shape != expected:
-            msg = (
-                "The shape of the mixing distribution probabilities must be "
-                "broadcastable to (len(x), n_components)"
-            )
-            raise ValueError(msg)
+        if self.mixing_vals is not None:
+            expected = (self.x.size, self._n_components)
+            if validate_args and self.mixing_distribution.probs.shape != expected:
+                msg = (
+                    "The shape of the mixing distribution probabilities must be "
+                    "broadcastable to (len(x), n_components)"
+                )
+                raise ValueError(msg)
+
+    def _make_mixing_distribution(
+        self, x: ArrayLike | None = None
+    ) -> dist.CategoricalProbs | dist.CategoricalLogits:
+        """
+        Returns the mixing distribution to use for a given x. If mixing_vals was not
+        provided at construction, this just returns the fixed mixing_distribution
+        (independent of x). Otherwise, the per-component mixing splines are evaluated
+        at x and turned into a (batched) CategoricalLogits distribution -- this is what
+        makes the mixing weights vary with x (e.g. phi1).
+        """
+        x = self.x if x is None else x
+        if self.mixing_vals is None:
+            return self.mixing_distribution
+
+        logits = jnp.stack([spl(x) for spl in self._mixing_spls], axis=-1)
+        logits = _clip_preserve_gradients(logits, *self.clip_mixing_logits)
+        return dist.CategoricalLogits(logits=logits, validate_args=False)
 
     def _make_components(self, x: ArrayLike | None = None) -> list[NormalSpline]:
         x = self.x if x is None else x
@@ -132,13 +217,14 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
         x: ArrayLike | None = None,
     ) -> jax.Array:
         value = jnp.array(value)
+        mixing_distribution = self._make_mixing_distribution(x)
         try:
             helper = dist.MixtureSameFamily(
-            self.mixing_distribution, self._make_components(x), validate_args=False
+            mixing_distribution, self._make_components(x), validate_args=False
         )
         except:
             helper = dist.MixtureGeneral(
-                self.mixing_distribution, self._make_components(x), validate_args=False
+                mixing_distribution, self._make_components(x), validate_args=False
             )
         return helper.component_log_probs(value)
 
@@ -153,16 +239,20 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
 class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
     def __init__(
         self,
-        mixing_distribution: dist.CategoricalProbs | dist.CategoricalLogits,
-        loc_vals: ArrayLike,
-        scale_vals: ArrayLike,
-        knots: ArrayLike,
-        x: ArrayLike,
+        mixing_distribution: dist.CategoricalProbs | dist.CategoricalLogits | None = None,
+        loc_vals: ArrayLike = None,
+        scale_vals: ArrayLike = None,
+        knots: ArrayLike = None,
+        x: ArrayLike = None,
+        mixing_vals: ArrayLike | None = None,
+        mixing_knots: ArrayLike | None = None,
         low: Any | None = None,
         high: Any | None = None,
         spline_k: int = 3,
         clip_locs: tuple[float | None, float | None] = (None, None),
         clip_scales: tuple[float | None, float | None] = (None, None),
+        clip_mixing_logits: tuple[float | None, float | None] = (None, None),
+        ordered_scales: bool = True,
         validate_args=None,
     ) -> None:
         """
@@ -174,8 +264,18 @@ class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
 
         x
             Array of x values at which to evaluate the splines.
+        mixing_vals (optional)
+            See ``Normal1DSplineMixture`` -- if provided (instead of
+            ``mixing_distribution``), the mixing weights are a smooth spline function of
+            x rather than fixed.
         spline_k
             Degree of the spline.
+        ordered_scales
+            See ``Normal1DSplineMixture`` -- if True (the default), scale_vals is
+            treated as quadrature increments so the reconstructed scale is forced
+            non-decreasing in component index at every knot. Set to False to use
+            scale_vals directly as the actual per-component scale, with components
+            identified by loc instead.
         """
         self.low = low
         self.high = high
@@ -189,9 +289,13 @@ class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
             scale_vals=scale_vals,
             knots=knots,
             x=x,
+            mixing_vals=mixing_vals,
+            mixing_knots=mixing_knots,
             spline_k=spline_k,
             clip_locs=clip_locs,
             clip_scales=clip_scales,
+            clip_mixing_logits=clip_mixing_logits,
+            ordered_scales=ordered_scales,
             validate_args=validate_args,
         )
 

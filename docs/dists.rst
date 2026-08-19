@@ -16,8 +16,12 @@ Equivalent to :class:`NormalSpline`, but for a truncated Normal distribution
 
 :class:`Normal1DSplineMixture`:
 Represents a mixture of Normal distributions where the loc and (log)scale parameters are
-controlled by splines that are evaluated at some other parameter values x. Takes a
-``mixing_distribution`` parameter which specifies the relative weights of the mixture components.
+controlled by splines that are evaluated at some other parameter values x. Takes either a
+``mixing_distribution`` parameter (a single, fixed weighting of the mixture components, shared
+across all x) or a ``mixing_vals`` parameter (per-knot mixing logits for each component, shape
+``(n_components, n_knots)``, exactly like ``loc_vals``/``scale_vals``): when ``mixing_vals`` is
+given, the mixing weights are themselves a smooth spline function of x instead of fixed. Exactly
+one of ``mixing_distribution`` or ``mixing_vals`` must be provided.
 
 :class:`TruncatedNormal1DSplineMixture`:
 Equivalent to :class:`Normal1DSplineMixture`, but for multiple truncated Normal distributions
